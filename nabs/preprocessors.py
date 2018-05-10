@@ -1,12 +1,9 @@
 import logging
-import time
 from asyncio import Future
-from copy import copy
 from threading import RLock, Event, Thread
 
 from bluesky.plan_stubs import drop, null, wait_for
 from bluesky.preprocessors import plan_mutator
-from ophyd.signal import EpicsSignalRO
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +112,7 @@ class SuspendPreprocessor:
         Mutate plan to call self._msg_proc on each msg that comes through.
         """
         if not self._subscribed:
-            self._sig.subscribe(self._update, event_type=signal.SUB_VALUE)
+            self._sig.subscribe(self._update, event_type=self._sig.SUB_VALUE)
             self._subscribed = True
         yield from plan_mutator(plan, self._msg_proc)
 
@@ -126,16 +123,20 @@ class SuspendPreprocessor:
         with self._rlock:
             if self._cmd is None or msg.command in self._cmd:
                 if not self._ok_future.done():
+
                     def new_gen():
                         yield from self._pre_plan()
                         yield from wait_for([self._ok_future])
                         yield from self._post_plan()
                         # Do the rest recursively so we can suspend again
                         logger.info('Resuming plan')
+
                         def inner_gen():
                             yield from self._follow_plan()
                             yield msg
+
                         yield from self(inner_gen())
+
                     return new_gen(), None
             return None, None
 
@@ -159,7 +160,7 @@ class SuspendAndDropReadings(SuspendPreprocessor):
         return to the suspended state.
     """
     def __init__(self, signal, *, sleep=0):
-        super().__init__(signal, commands=('trigger', 'create', 'read')
+        super().__init__(signal, commands=('trigger', 'create', 'read'),
                          sleep=sleep, pre_plan=self._try_drop,
                          follow_plan=self._retry)
         self._msg_cache = []
@@ -167,7 +168,7 @@ class SuspendAndDropReadings(SuspendPreprocessor):
     def _try_drop(self):
         try:
             yield from drop()
-        except:
+        except Exception:
             yield from null()
 
     def _retry(self):
@@ -177,7 +178,7 @@ class SuspendAndDropReadings(SuspendPreprocessor):
     def _msg_proc(self, msg):
         if msg.command in self._cmd:
             self._msg_cache.append(msg)
-        elif msg.command in ('save', 'drop')
+        elif msg.command in ('save', 'drop'):
             self._msg_cache = []
         return super()._msg_proc(msg)
 
@@ -185,13 +186,40 @@ class SuspendAndDropReadings(SuspendPreprocessor):
 class BeamDropSuspender(SuspendAndDropReadings):
     """
     Drop bad readings, suspend on beam drop.
+
+    Parameters
+    ----------
+    beam_stats: ``BeamStats``
+        A ``pcdsdevices.beam_stats.BeamStats`` object.
+
+    min_beam: ``float``, optional keyword-only
+        The minimum allowable beam level. If the beam average drops below
+        this level, we will suspend trigger/create/read events and replay
+        unfinished event bundles. The default is 0.1.
+
+    avg: ``int``, optional keyword-only
+        The number of gas detector shots to average over.
+
+    sleep: ``int`` or ``float``, optional
+        The amount of time to wait after `should_resume` returns ``True``
+        before ending the suspension. If `should_suspend` return ``True`` at
+        any time during this wait period, we will cancel the resumption and
+        return to the suspended state.
     """
-    def __init__(self, beam_stats, *, min_beam=0, avg=120, sleep=None):
+    def __init__(self, beam_stats, *, min_beam=0.1, avg=120, sleep=5):
         super().__init__(beam_stats.mj_avg, sleep=sleep)
-        beam_stats.mj_avg.averages = avg
+        self.averages = avg
         self.min_beam = min_beam
 
     def should_suspend(self, value):
-        if value <= self.min_beam:
+        if value < self.min_beam:
             return True
         return False
+
+    @property
+    def averages(self, avg):
+        return self._sig.averages
+
+    @averages.setter
+    def averages(self, avg):
+        self._sig.averages = avg
