@@ -1,73 +1,197 @@
+import logging
+import time
 from asyncio import Future
 from copy import copy
 from threading import RLock, Event, Thread
 
-from bluesky.plan_stubs import drop, wait_for
+from bluesky.plan_stubs import drop, null, wait_for
 from bluesky.preprocessors import plan_mutator
+from ophyd.signal import EpicsSignalRO
+
+logger = logging.getLogger(__name__)
 
 
-class EnsureGoodReads:
+class SuspendPreprocessor:
     """
-    Ensure that reads only happen under good conditions.
-    Plan preprocessor that takes note of trigger, read, and save messages while
-    monitoring a boolean signal. When the boolean signal is high (1), messages
-    proceed as normal. When the boolean signal goes low (0), we wait for it to
-    go high for a minimum amount of time, then retry any trigger/read calls
-    that were pending. Potentially bad readings are dropped.
+    Base preprocessor that suspends on specific commands based on a signal.
+
+    Parameters
+    ----------
+    signal: ``Signal``
+        The signal to subscribe to, whose value determines when to suspend.
+
+    commands: ``list of str``, optional
+        The commands to suspend on. If omitted, we'll suspend on all commands.
+
+    sleep: ``int`` or ``float``, optional
+        The amount of time to wait after `should_resume` returns ``True``
+        before ending the suspension. If `should_suspend` return ``True`` at
+        any time during this wait period, we will cancel the resumption and
+        return to the suspended state.
+
+    pre_plan: ``plan`` with no arguments, optional
+        If provided, we'll follow this plan before waiting for the suspension
+        to expire. This can be used to clean up before a suspension.
+
+    post_plan: ``plan`` with no arguments, optional
+        If provided, we'll follow this plan before waiting for the suspension
+        to expire. This can be used to restore state after a suspension.
+
+    follow_plan: ``plan`` with no arguments, optional
+        This is a second post-plan, that in itself can be suspended. This can
+        be used by a subclass to retry previous commands before proceeding,
+        while allowing these commands to be suspended if conditions change.
     """
-    def __init__(self, ok_sig, sleep_time=0):
-        self.ok_sig = ok_sig
-        self.sleep_time = float(sleep_time)
-        self.lock = RLock()
-        self.not_ok_flag = Event()
-        self.future = None
-        self.msg_cache = []
+    def __init__(self, signal, *, commands=None, sleep=0,
+                 pre_plan=null, post_plan=null, follow_plan=null):
+        self._sig = signal
+        self._cmd = commands
+        self._sleep = sleep
+        self._pre_plan = pre_plan
+        self._post_plan = post_plan
+        self._follow_plan = follow_plan
+        self._resume_ts = None
+        self._suspend_ev = Event()
+        self._ok_future = Future()
+        self._ok_future.set_result('ok')
+        self._rlock = RLock()
+        self._subscribed = False
 
-        ok_sig.subscribe(self.ok_cb)
+    def should_suspend(self, value):
+        """
+        Returns ``True`` if we should suspend.
 
-    def ok_cb(self, *args, **kwargs):
-        with self.lock:
-            # Ok to read
-            if kwargs['value']:
-                if self.future is not None:
-                    self.not_ok_flag.clear()
-                    self.run_ok_thread()
-            # Not ok to read
+        Parameters
+        ----------
+        value: signal value
+            The value reported by a signal callback.
+        """
+        raise NotImplementedError()
+
+    def should_resume(self, value):
+        """
+        Returns ``True`` if we should resume.
+
+        Parameters
+        ----------
+        value: signal value
+            The value reported by a signal callback.
+        """
+        return not self.should_suspend()
+
+    def _update(self, *, value, **kwargs):
+        """
+        Update routine for when the signal's value changes.
+
+        If we're running normally but we should_suspend, we'll trigger the
+        suspend state. If suspended but we should_resume, we'll start a timer
+        of length sleep to clear the suspend state. This will be interrupted if
+        another value change leads us to should_suspend.
+        """
+        with self._rlock:
+            if self._suspend_ev.is_set():
+                if self.should_resume(value):
+                    self._suspend_ev.clear()
+                    self._run_release_thread()
             else:
-                if self.future is None:
-                    self.future = Future()
-                self.not_ok_flag.set()
+                if self.should_suspend(value):
+                    logger.info('Suspending due to bad %s value=%s',
+                                self._sig.name, value)
+                    self._suspend_ev.set()
+                    self._ok_future = Future()
 
-    def run_ok_thread(self):
-        t = Thread(target=self.ok_thread, args=())
+    def _run_release_thread(self):
+        logger.info('%s suspension is over, waiting for %ss then resuming.',
+                    self._sig.name, self._sleep)
+        t = Thread(target=self._release_thread, args=())
         t.start()
 
-    def ok_thread(self):
-        if not self.not_ok_flag.wait(timeout=self.sleep_time):
-            self.future.set_result('Done')
+    def _release_thread(self):
+        if not self._suspend_ev.wait(timeout=self._sleep):
+            self._ok_future.set_result('ok')
 
     def __call__(self, plan):
-        yield from plan_mutator(plan, self.msg_proc)
+        """
+        Mutate plan to call self._msg_proc on each msg that comes through.
+        """
+        if not self._subscribed:
+            self._sig.subscribe(self._update, event_type=signal.SUB_VALUE)
+            self._subscribed = True
+        yield from plan_mutator(plan, self._msg_proc)
 
-    def msg_proc(self, msg):
-        if msg.command == 'save':
-            self.msg_cache = []
-        elif msg.command in ['trigger', 'create', 'read']:
-            self.msg_cache.append(msg)
-            if not self.ok_sig.get():
-                return (self.wait_and_retry, None)
-        return (None, None)
+    def _msg_proc(self, msg):
+        """
+        At each msg, decide if we should wait for a suspension to lift.
+        """
+        with self._rlock:
+            if self._cmd is None or msg.command in self._cmd:
+                if not self._ok_future.done():
+                    def new_gen():
+                        yield from self._pre_plan()
+                        yield from wait_for([self._ok_future])
+                        yield from self._post_plan()
+                        # Do the rest recursively so we can suspend again
+                        logger.info('Resuming plan')
+                        def inner_gen():
+                            yield from self._follow_plan()
+                            yield msg
+                        yield from self(inner_gen())
+                    return new_gen(), None
+            return None, None
 
-    def wait_and_retry(self):
+
+class SuspendAndDropReadings(SuspendPreprocessor):
+    """
+    SuspendPreprocessor that drops and repeats potentially bad readings.
+
+    This can be used to pause a plan during bad conditions, drop open event
+    bundles, and redo the readings once conditions return to normal
+
+    Parameters
+    ----------
+    signal: ``Signal``
+        The signal to subscribe to, whose value determines when to suspend.
+
+    sleep: ``int`` or ``float``, optional
+        The amount of time to wait after `should_resume` returns ``True``
+        before ending the suspension. If `should_suspend` return ``True`` at
+        any time during this wait period, we will cancel the resumption and
+        return to the suspended state.
+    """
+    def __init__(self, signal, *, sleep=0):
+        super().__init__(signal, commands=('trigger', 'create', 'read')
+                         sleep=sleep, pre_plan=self._try_drop,
+                         follow_plan=self._retry)
+        self._msg_cache = []
+
+    def _try_drop(self):
         try:
             yield from drop()
-        except Exception:
-            pass
+        except:
+            yield from null()
 
-        yield from wait_for([self.future])
+    def _retry(self):
+        for msg in self._msg_cache:
+            yield msg
 
-        # Recursion alert... but this is probably ok.
-        # Watch the replayed message for bad state too.
-        cache = copy(self.msg_cache)
-        self.msg_cache = []
-        yield from plan_mutator(cache, self.msg_proc)
+    def _msg_proc(self, msg):
+        if msg.command in self._cmd:
+            self._msg_cache.append(msg)
+        elif msg.command in ('save', 'drop')
+            self._msg_cache = []
+        return super()._msg_proc(msg)
+
+
+class BeamDropSuspender(SuspendAndDropReadings):
+    """
+    Drop bad readings, suspend on beam drop.
+    """
+    def __init__(self, beam_stats, *, min_beam=0, avg=120, sleep=None):
+        super().__init__(beam_stats.mj_avg, sleep=sleep)
+        beam_stats.mj_avg.averages = avg
+        self.min_beam = min_beam
+
+    def should_suspend(self, value):
+        if value <= self.min_beam:
+            return True
+        return False
