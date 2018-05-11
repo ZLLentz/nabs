@@ -1,6 +1,6 @@
+import asyncio
 import logging
-from asyncio import Future
-from threading import RLock, Event, Thread
+from threading import RLock, Event
 
 from bluesky.plan_stubs import drop, null, wait_for
 from bluesky.preprocessors import plan_mutator
@@ -47,12 +47,13 @@ class SuspendPreprocessor:
         self._pre_plan = pre_plan
         self._post_plan = post_plan
         self._follow_plan = follow_plan
+        self._suspend_active = False
         self._resume_ts = None
         self._suspend_ev = Event()
-        self._ok_future = Future()
+        self._ok_future = asyncio.Future()
         self._ok_future.set_result('ok')
         self._rlock = RLock()
-        self._subscribed = False
+        self._subid = None
 
     def should_suspend(self, value):
         """
@@ -74,7 +75,7 @@ class SuspendPreprocessor:
         value: signal value
             The value reported by a signal callback.
         """
-        return not self.should_suspend()
+        return not self.should_suspend(value)
 
     def _update(self, *, value, **kwargs):
         """
@@ -94,27 +95,36 @@ class SuspendPreprocessor:
                 if self.should_suspend(value):
                     logger.info('Suspending due to bad %s value=%s',
                                 self._sig.name, value)
+                    loop = asyncio.get_event_loop()
+                    self._ok_future = loop.create_future()
                     self._suspend_ev.set()
-                    self._ok_future = Future()
 
     def _run_release_thread(self):
         logger.info('%s suspension is over, waiting for %ss then resuming.',
                     self._sig.name, self._sleep)
-        t = Thread(target=self._release_thread, args=())
-        t.start()
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, self._release_thread)
 
     def _release_thread(self):
-        if not self._suspend_ev.wait(timeout=self._sleep):
+        logger.debug('Worker waiting to release suspender...')
+        if self._suspend_ev.wait(timeout=self._sleep):
+            logger.debug('Worker canceling suspender release')
+        else:
+            logger.debug('Worker releasing suspender')
             self._ok_future.set_result('ok')
 
     def __call__(self, plan):
         """
         Mutate plan to call self._msg_proc on each msg that comes through.
         """
-        if not self._subscribed:
-            self._sig.subscribe(self._update, event_type=self._sig.SUB_VALUE)
-            self._subscribed = True
+        logger.debug('Running plan with suspender')
+        if self._subid is None:
+            self._subid = self._sig.subscribe(self._update,
+                                              event_type=self._sig.SUB_VALUE)
         yield from plan_mutator(plan, self._msg_proc)
+        if self._subid is not None:
+            self._sig.unsubscribe(self._subid)
+            self._subid = None
 
     def _msg_proc(self, msg):
         """
@@ -122,7 +132,9 @@ class SuspendPreprocessor:
         """
         with self._rlock:
             if self._cmd is None or msg.command in self._cmd:
-                if not self._ok_future.done():
+                if not self._ok_future.done() and not self._suspend_active:
+                    logger.debug('saw msg_proc(%s), suspend now', msg)
+                    self._suspend_active = True
 
                     def new_gen():
                         yield from self._pre_plan()
@@ -130,6 +142,7 @@ class SuspendPreprocessor:
                         yield from self._post_plan()
                         # Do the rest recursively so we can suspend again
                         logger.info('Resuming plan')
+                        self._suspend_active = False
 
                         def inner_gen():
                             yield from self._follow_plan()
