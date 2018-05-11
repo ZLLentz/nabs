@@ -1,9 +1,11 @@
 import asyncio
 import logging
+import time
 from threading import RLock, Event
 
-from bluesky.plan_stubs import drop, null, wait_for
+from bluesky.plan_stubs import drop, save, null, wait_for
 from bluesky.preprocessors import plan_mutator
+from bluesky.utils import make_decorator
 
 logger = logging.getLogger(__name__)
 
@@ -25,28 +27,12 @@ class SuspendPreprocessor:
         before ending the suspension. If `should_suspend` return ``True`` at
         any time during this wait period, we will cancel the resumption and
         return to the suspended state.
-
-    pre_plan: ``plan`` with no arguments, optional
-        If provided, we'll follow this plan before waiting for the suspension
-        to expire. This can be used to clean up before a suspension.
-
-    post_plan: ``plan`` with no arguments, optional
-        If provided, we'll follow this plan before waiting for the suspension
-        to expire. This can be used to restore state after a suspension.
-
-    follow_plan: ``plan`` with no arguments, optional
-        This is a second post-plan, that in itself can be suspended. This can
-        be used by a subclass to retry previous commands before proceeding,
-        while allowing these commands to be suspended if conditions change.
     """
     def __init__(self, signal, *, commands=None, sleep=0,
                  pre_plan=null, post_plan=null, follow_plan=null):
         self._sig = signal
         self._cmd = commands
         self._sleep = sleep
-        self._pre_plan = pre_plan
-        self._post_plan = post_plan
-        self._follow_plan = follow_plan
         self._suspend_active = False
         self._resume_ts = None
         self._suspend_ev = Event()
@@ -139,63 +125,18 @@ class SuspendPreprocessor:
 
                     def new_gen():
                         self._suspend_active = True
-                        yield from self._pre_plan()
                         yield from wait_for([self._ok_future])
-                        yield from self._post_plan()
                         logger.info('Resuming plan')
                         self._suspend_active = False
-                        yield from self._follow_plan()
                         yield msg
 
                     return new_gen(), None
             return None, None
 
 
-class SuspendAndDropReadings(SuspendPreprocessor):
+class BeamSuspender(SuspendPreprocessor):
     """
-    SuspendPreprocessor that drops and repeats potentially bad readings.
-
-    This can be used to pause a plan during bad conditions, drop open event
-    bundles, and redo the readings once conditions return to normal
-
-    Parameters
-    ----------
-    signal: ``Signal``
-        The signal to subscribe to, whose value determines when to suspend.
-
-    sleep: ``int`` or ``float``, optional
-        The amount of time to wait after `should_resume` returns ``True``
-        before ending the suspension. If `should_suspend` return ``True`` at
-        any time during this wait period, we will cancel the resumption and
-        return to the suspended state.
-    """
-    def __init__(self, signal, *, sleep=0):
-        super().__init__(signal, commands=('trigger', 'create', 'read'),
-                         sleep=sleep, pre_plan=self._try_drop,
-                         follow_plan=self._retry)
-        self._msg_cache = []
-
-    def _try_drop(self):
-        try:
-            yield from drop()
-        except Exception:
-            yield from null()
-
-    def _retry(self):
-        for msg in self._msg_cache:
-            yield msg
-
-    def _msg_proc(self, msg):
-        if msg.command in self._cmd:
-            self._msg_cache.append(msg)
-        elif msg.command in ('save', 'drop'):
-            self._msg_cache = []
-        return super()._msg_proc(msg)
-
-
-class BeamDropSuspender(SuspendAndDropReadings):
-    """
-    Drop bad readings, suspend on beam drop.
+    Suspend readings on beam drop.
 
     Parameters
     ----------
@@ -217,7 +158,8 @@ class BeamDropSuspender(SuspendAndDropReadings):
         return to the suspended state.
     """
     def __init__(self, beam_stats, *, min_beam=0.1, avg=120, sleep=5):
-        super().__init__(beam_stats.mj_avg, sleep=sleep)
+        super().__init__(beam_stats.mj_avg, sleep=sleep,
+                         commands=('trigger', 'create', 'read'))
         self.averages = avg
         self.min_beam = min_beam
 
@@ -233,3 +175,88 @@ class BeamDropSuspender(SuspendAndDropReadings):
     @averages.setter
     def averages(self, avg):
         self._sig.averages = avg
+
+
+class DropWrapper:
+    """
+    Replaces ``save`` messages with ``drop`` if the event is bad.
+
+    Parameters
+    ----------
+    filters: ``dict``, optional
+        A dictionary mapping from read key to function of one argument. This
+        is an "is_bad_value(value)" function that should return ``True`` if the
+        value is bad.
+
+    max_dt: ``float``, optional
+        If provided, we'll ``drop`` events if the time from before the first
+        read to after the last read is greater than this number.
+    """
+    def __init__(self, filters=None, max_dt=None):
+        self.filters = filters
+        self.max_dt = max_dt
+
+    def __call__(self, plan):
+        yield from plan_mutator(plan, self._msg_proc)
+
+    def _msg_proc(self, msg):
+        if msg.command == 'create':
+            self.ret = {}
+            self.first_read_time = None
+            self.last_read_time = None
+            return None, None
+        elif msg.command == 'read':
+            return self._cache_read(msg), None
+        elif msg.command == 'save':
+            return self._filter_save(), None
+
+    def _cache_read(self, msg):
+        if self.first_read_time is None:
+            self.first_read_time = time.time()
+        ret = yield msg
+        self.ret.update(ret)
+        self.last_read_time = time.time()
+        return ret
+
+    def _filter_save(self):
+        dt = self.last_read_time - self.first_read_time
+        if self.max_dt is not None and dt > self.max_dt:
+            logger.info(('Event took %ss to bundle, readings are desynced. '
+                         'Dropping'), dt)
+            return (yield from drop())
+        elif self.filters is not None:
+            for key, filt in self.filters.items():
+                try:
+                    value = self.ret[key]
+                except KeyError:
+                    logger.debug('Read bundle did not have filter key %s', key)
+                    value = None
+                if value is not None and filt[value]:
+                    logger.info('Event had bad value %s=%s. Dropping',
+                                key, value)
+                    return (yield from drop())
+        return (yield from save())
+
+
+def drop_wrapper(plan, filters, max_dt):
+    """
+    Replaces ``save`` messages with ``drop`` if the event is bad.
+
+    Parameters
+    ----------
+    plan: ``plan``
+        The plan to wrap.
+
+    filters: ``dict``, optional
+        A dictionary mapping from read key to function of one argument. This
+        is an "is_bad_value(value)" function that should return ``True`` if the
+        value is bad.
+
+    max_dt: ``float``, optional
+        If provided, we'll ``drop`` events if the time from before the first
+        read to after the last read is greater than this number.
+    """
+    yield from DropWrapper(filters, max_dt)(plan)
+
+
+drop_decorator = make_decorator(drop_wrapper)
