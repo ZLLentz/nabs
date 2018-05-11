@@ -134,21 +134,16 @@ class SuspendPreprocessor:
             if self._cmd is None or msg.command in self._cmd:
                 if not self._ok_future.done() and not self._suspend_active:
                     logger.debug('saw msg_proc(%s), suspend now', msg)
-                    self._suspend_active = True
 
                     def new_gen():
+                        self._suspend_active = True
                         yield from self._pre_plan()
                         yield from wait_for([self._ok_future])
                         yield from self._post_plan()
-                        # Do the rest recursively so we can suspend again
                         logger.info('Resuming plan')
                         self._suspend_active = False
-
-                        def inner_gen():
-                            yield from self._follow_plan()
-                            yield msg
-
-                        yield from self(inner_gen())
+                        yield from self._follow_plan()
+                        yield msg
 
                     return new_gen(), None
             return None, None
