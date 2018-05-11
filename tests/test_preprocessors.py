@@ -38,16 +38,14 @@ def wait_for_future(future):
     logger.debug('done waiting for future')
 
 
-def assert_suspend_release(plan, susp, sig, follow=True):
+def assert_suspend_release(plan, susp, sig):
     sig.put(1)
     assert susp._suspend_ev.is_set()
-    assert next(plan).command == 'null'      # pre_plan
-    assert next(plan).command == 'wait_for'  # suspend
+    # Suspend
+    assert next(plan).command == 'wait_for'
     sig.put(0)
     wait_for_future(susp._ok_future)
-    assert next(plan).command == 'null'      # post_plan
-    if follow:
-        assert next(plan).command == 'null'  # follow_plan
+    assert next(plan).command == 'null'
 
 
 def assert_plan_done(plan):
@@ -109,11 +107,11 @@ def test_suspend_in_follow_up(sig):
 
     plan = susp(test_plan())
     assert next(plan).command == 'sleep'
-    assert_suspend_release(plan, susp, sig, follow=False)
-    # Now we're right before follow-up plan, suspend again
     assert_suspend_release(plan, susp, sig)
-    assert next(plan).command == 'null'      # follow_plan 2
-    assert next(plan).command == 'sleep'     # back to plan
+    # Suspend before redoing old message
+    assert_suspend_release(plan, susp, sig)
+    # Back to plan
+    assert next(plan).command == 'sleep'
     assert_plan_done(plan)
 
 

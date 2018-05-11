@@ -1,8 +1,12 @@
+import logging
+
 from bluesky.plan_stubs import subscribe, trigger_and_read, repeat
 from bluesky.preprocessors import stage_decorator, subs_decorator
 
 from .callbacks import EventCounter
 from .streams import AverageStream
+
+logger = logging.getLogger(__name__)
 
 
 def count_events(detectors, num=1, delay=None, *, md=None):

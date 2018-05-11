@@ -118,6 +118,7 @@ class SuspendPreprocessor:
         """
         At each msg, decide if we should wait for a suspension to lift.
         """
+        logger.debug('enter msg_proc')
         with self._rlock:
             if self._cmd is None or msg.command in self._cmd:
                 if not self._ok_future.done() and not self._suspend_active:
@@ -126,8 +127,8 @@ class SuspendPreprocessor:
                     def new_gen():
                         self._suspend_active = True
                         yield from wait_for([self._ok_future])
-                        logger.info('Resuming plan')
                         self._suspend_active = False
+                        logger.info('Resuming plan')
                         yield msg
 
                     return new_gen(), None
