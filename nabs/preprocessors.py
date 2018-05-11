@@ -121,10 +121,12 @@ class SuspendPreprocessor:
         if self._subid is None:
             self._subid = self._sig.subscribe(self._update,
                                               event_type=self._sig.SUB_VALUE)
-        yield from plan_mutator(plan, self._msg_proc)
-        if self._subid is not None:
-            self._sig.unsubscribe(self._subid)
-            self._subid = None
+        try:
+            yield from plan_mutator(plan, self._msg_proc)
+        finally:
+            if self._subid is not None:
+                self._sig.unsubscribe(self._subid)
+                self._subid = None
 
     def _msg_proc(self, msg):
         """
