@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 import pytest
+import matplotlib  # NOQA, do before setting up logs
 
 if __name__ == '__main__':
     # Show output results from every test function
