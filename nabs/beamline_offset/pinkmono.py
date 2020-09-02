@@ -41,7 +41,9 @@ def beamline_to_mono(offsets=None):
 
     devices = [dev for dev in offsets.keys() if not isinstance(dev, str)]
 
+    print('Synchronizing preset database')
     preset_sync(devices)
+    print('Saving pink references')
     beamline_save_pink_ref(offsets=offsets)
 
     moved_motors = []
@@ -53,8 +55,10 @@ def beamline_to_mono(offsets=None):
                 moved_motors.append(motor)
             except AttributeError:
                 pass
+    print('Waiting for motor moves to complete')
     for motor in moved_motors:
         motor.wait()
+    print('Done')
 
 
 def beamline_to_pink(offsets=None):
@@ -63,6 +67,7 @@ def beamline_to_pink(offsets=None):
 
     devices = [dev for dev in offsets.keys() if not isinstance(dev, str)]
 
+    print('Synchronizing preset database')
     preset_sync(devices)
 
     moved_motors = []
@@ -76,6 +81,7 @@ def beamline_to_pink(offsets=None):
                 pass
     for motor in moved_motors:
         motor.wait()
+    print('Clearing previous pink references')
     beamline_clear_pink_ref(moved_motors)
 
 
@@ -86,22 +92,28 @@ def beamline_save_pink_ref(offsets=None):
     for dev, offset in offsets.items():
         # Skip position group values
         if isinstance(dev, str):
+            print('Skipping string device {}', dev)
             continue
         # Skip removed devices
         if not dev.inserted:
+            print('Skipping not-inserted device {}', dev)
             continue
         # Skip devices with an active pink_ref
         motor = find_motor(dev)
         try:
             motor.presets.positions.pink_ref
-        except AttributeError:
+            print('Skipping device with active pink ref {}', dev)
             continue
+        except AttributeError:
+            pass
         # Identify which position group we use
         while isinstance(offset, str):
             offset = offsets[offset]
         # Save the presets
         pink = motor.position
         mono = pink + offset
+        text = 'For {}, saving pink_ref={}, mono_ref={}'
+        print(text.format(motor.name, pink, mono))
         motor.presets.add_hutch('pink_ref', pink,
                                 'automatic preset for ccm beamline shift')
         motor.presets.add_hutch('mono_ref', mono,
@@ -116,6 +128,8 @@ def beamline_clear_pink_ref(motors=None):
         for preset_name in ('pink_ref', 'mono_ref'):
             try:
                 preset_obj = getattr(motor.presets.positions, preset_name)
+                text = 'Clearing old pink_ref and mono_ref on {}'
+                print(text.format(motor.name))
                 preset_obj.deactivate()
             except AttributeError:
                 pass
