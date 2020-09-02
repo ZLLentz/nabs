@@ -4,8 +4,8 @@ from ophyd import Component as Cpt, Device, Signal
 from pcdsdevices.interface import setup_preset_paths
 from pcdsdevices.sim import FastMotor
 
-from .pinkmono import beamline_to_mono, beamline_to_pink,
-                      beamline_mono_offsets
+from .pinkmono import (beamline_to_mono, beamline_to_pink,
+                       beamline_mono_offsets)
 
 
 class TestStates(Device):
