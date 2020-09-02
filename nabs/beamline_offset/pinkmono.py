@@ -10,7 +10,7 @@ Goal:
 
 user-facing:
 
-beamline_pink_offsets <dict of states_device:offset, special key "default"
+beamline_mono_offsets <dict of states_device:offset, special key "default"
                        and special value "default">
 - contains state devices with motors attached, mapped to offset value or None
 - 'default' means the default offset
@@ -33,11 +33,11 @@ beamline_save_pink_ref()
 beamline_clear_pink_ref(<opts>)
 - deactivate all/some "pink_ref" and "mono_ref" presets
 """
-beamline_pink_offsets = {'default': 8}
+beamline_mono_offsets = {'default': 7.5}
 
 def beamline_to_mono(offsets=None)
     if offsets is None:
-        offsets = beamline_pink_offsets
+        offsets = beamline_mono_offsets
 
     devices = [dev for dev in offsets.keys() if not isinstance(dev, str)]
 
@@ -59,7 +59,7 @@ def beamline_to_mono(offsets=None)
 
 def beamline_to_pink(offsets=None):
     if offsets is None:
-        offsets = beamline_pink_offsets
+        offsets = beamline_mono_offsets
 
     devices = [dev for dev in offsets.keys() if not isinstance(dev, str)]
 
@@ -81,7 +81,7 @@ def beamline_to_pink(offsets=None):
 
 def beamline_save_pink_ref(offsets=None):
     if offsets is None:
-        offsets = beamline_pink_offsets
+        offsets = beamline_mono_offsets
 
     for dev, offset in offsets.items():
         # Skip position group values
@@ -109,7 +109,7 @@ def beamline_save_pink_ref(offsets=None):
 
 def beamline_clear_pink_ref(motors=None):
     if motors is None:
-        motors = [find_motor(dev) for dev in beamline_pink_offsets.keys()
+        motors = [find_motor(dev) for dev in beamline_mono_offsets.keys()
                   if not isinstance(dev, str)]
 
     for motor in motors:
