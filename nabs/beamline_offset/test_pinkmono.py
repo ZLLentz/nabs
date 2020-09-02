@@ -35,5 +35,5 @@ def setup_test_offsets(offsets):
 if __name__ == '__main__':
     setup_test_presets()
     hw = get_test_hardware()
-    setup_test_offsets(hw)
+    setup_test_offsets({dev: 'default' for dev in hw.values()})
     globals().update(hw)
