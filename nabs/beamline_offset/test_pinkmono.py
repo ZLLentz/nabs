@@ -1,14 +1,14 @@
 from pathlib import Path
 
 from ophyd import Component as Cpt, Device, Signal
-from pcdsdevices.interface import setup_preset_paths
+from pcdsdevices.interface import BaseInterface, setup_preset_paths
 from pcdsdevices.sim import FastMotor
 
 from pinkmono import (beamline_to_mono, beamline_to_pink,
                       beamline_mono_offsets)
 
 
-class TestStates(Device):
+class TestStates(BaseInterface, Device):
     motor = Cpt(FastMotor)
 
     def __init__(self, prefix, *, name, inserted=True, **kwargs):
