@@ -137,4 +137,3 @@ def find_motor(device):
         except Exception:
             pass
     raise TypeError(f'Device {device} has no motor!')
-
