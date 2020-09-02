@@ -13,12 +13,12 @@ class TestStates(Device):
 
     def __init__(self, prefix, *, name, inserted=True, **kwargs):
         self.inserted = bool(inserted)
-        super().__init__(self, prefix, name=name, **kwargs)
+        super().__init__(prefix, name=name, **kwargs)
 
 
 def setup_test_presets():
-    presets = Path(__file__).abspath.parent / 'test_presets'
-    setup_presets_path(hutch=presets)
+    presets = Path(__file__).resolve().parent / 'test_presets'
+    setup_preset_paths(hutch=presets)
 
 
 def get_test_hardware():

@@ -35,7 +35,7 @@ beamline_clear_pink_ref(<opts>)
 """
 beamline_mono_offsets = {'default': 7.5}
 
-def beamline_to_mono(offsets=None)
+def beamline_to_mono(offsets=None):
     if offsets is None:
         offsets = beamline_mono_offsets
 
