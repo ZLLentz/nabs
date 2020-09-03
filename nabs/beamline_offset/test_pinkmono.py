@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 from ophyd import Component as Cpt, Device, Signal
@@ -33,6 +34,7 @@ def setup_test_offsets(offsets):
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
     setup_test_presets()
     hw = get_test_hardware()
     setup_test_offsets({dev: 'default' for dev in hw.values()})
